@@ -1,8 +1,10 @@
+from datetime import datetime
 from enum import Enum
 from os import path
 from typing import Dict, List
 
 import pandas as pd
+import requests
 import snowflake.connector
 from jinja2 import Template
 from pydantic import Field, SecretStr, constr, create_model
@@ -77,6 +79,7 @@ class SnowflakeConnector(ToucanConnector):
     user: str = Field(..., description='Your login username')
     password: SecretStr = Field(None, description='Your login password')
     oauth_token: str = Field(None, description='Your oauth token')
+    oauth_args: dict = Field(None, description='Named arguments for an OIDC auth')
     account: str = Field(
         ...,
         description='The full name of your Snowflake account. '
@@ -116,8 +119,36 @@ class SnowflakeConnector(ToucanConnector):
 
         return res
 
+    def _refresh_oauth_token(self):
+        """Regenerates an oauth token if configuration was provided and if the given token has expired."""
+        if 'refresh_token' in self.oauth_args:
+            if datetime.fromtimestamp(self.oauth_args['exp']) < datetime.now():
+                content_type = 'application/json'
+                # Content-Type may need to be overridden
+                if 'content_type' in self.oauth_args:
+                    content_type = self.oauth_args['content_type']
+                res = requests.post(
+                    self.oauth_args['token_endpoint'],
+                    data={
+                        'grant_type': 'refresh_token',
+                        'client_id': self.oauth_args['client_id'],
+                        'client_secret': self.oauth_args['client_secret'],
+                        'refresh_token': self.oauth_args['refresh_token'],
+                    },
+                    headers={'Content-Type': content_type},
+                )
+                # TODO: throw an exception if res.status_code is not 200
+                recieved_payload = res.json()
+                self.oauth_args['access_token'] = recieved_payload['access_token']
+                self.oauth_args['id_token'] = recieved_payload['id_token']
+                self.oauth_args['exp'] = datetime.now().timestamp() + recieved_payload['expires_in']
+
     def connect(self, **kwargs) -> snowflake.connector.SnowflakeConnection:
-        return snowflake.connector.connect(**self.get_connection_params(), **kwargs)
+        if self.oauth_args and self.authentication_method:
+            self._refresh_oauth_token()
+        connection_params = self.get_connection_params()
+
+        return snowflake.connector.connect(**connection_params, **kwargs)
 
     def _get_warehouses(self) -> List[str]:
         with self.connect() as connection:
